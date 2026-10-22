@@ -1,0 +1,114 @@
+# Copyright (c) 2026 Qianyuan Wuji Group (WUJILabs)
+# 闻道手表与 iPhone 原生端 CI：WendaoKit 单测 → XcodeGen 生成工程 → iOS / watchOS 模拟器编译 → iOS 端单测。
+# 本仓没有 Mac，真编译只在这里。只在 apps/wendao-watch/** 或本文件变更时触发。
+name: wendao-watch-ci
+
+on:
+  push:
+    paths:
+      - 'apps/wendao-watch/**'
+      - '.github/workflows/wendao-watch-ci.yml'
+  pull_request:
+    paths:
+      - 'apps/wendao-watch/**'
+      - '.github/workflows/wendao-watch-ci.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: wendao-watch-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: apps/wendao-watch
+
+jobs:
+  # 纯逻辑核心在 Linux 容器里也能编译并全量单测（无 CryptoKit/钥匙串时走可移植实现），先挡住大部分回归
+  wendaokit-linux:
+    runs-on: ubuntu-latest
+    container: swift:6.2
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: apps/wendao-watch/WendaoKit
+    steps:
+      - uses: actions/checkout@v4
+      - run: swift build -Xswiftc -warnings-as-errors
+      - run: swift test
+
+  build-and-test:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      DERIVED: ${{ github.workspace }}/DerivedData
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 选用最新 Xcode 26
+        run: |
+          ls -d /Applications/Xcode*.app || true
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -z "$XCODE" ]; then XCODE=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1); fi
+          echo "使用 $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
+          swift --version
+          xcrun simctl list runtimes
+
+      - name: WendaoKit 单测（swift test）
+        working-directory: apps/wendao-watch/WendaoKit
+        run: swift test 2>&1 | tee ../swift-test.log
+
+      - name: 安装 XcodeGen 并生成工程
+        run: |
+          brew install xcodegen
+          xcodegen --version
+          xcodegen generate
+
+      - name: 编译 iOS（模拟器，含内嵌手表 App）
+        run: |
+          set -o pipefail
+          xcodebuild build -project Wendao.xcodeproj -scheme Wendao \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild-ios.log | grep -E "error:|warning: .*(Sendable|actor|isolat)|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" xcodebuild-ios.log
+
+      - name: 编译 watchOS（模拟器）
+        run: |
+          set -o pipefail
+          xcodebuild build -project Wendao.xcodeproj -scheme WendaoWatch \
+            -destination 'generic/platform=watchOS Simulator' -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild-watch.log | grep -E "error:|warning: .*(Sendable|actor|isolat)|BUILD (SUCCEEDED|FAILED)" || true
+          grep -q "BUILD SUCCEEDED" xcodebuild-watch.log
+
+      - name: iOS 端单测（模拟器）
+        run: |
+          set -o pipefail
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)["devices"]
+          best = None
+          for runtime, devs in data.items():
+              if "iOS" not in runtime:
+                  continue
+              ver = tuple(int(x) for x in runtime.rsplit("iOS-", 1)[-1].split("-") if x.isdigit())
+              for d in devs:
+                  if d["name"].startswith("iPhone") and (best is None or ver > best[0]):
+                      best = (ver, d["udid"], d["name"], runtime)
+          print(best[1] if best else "")
+          ')
+          echo "模拟器 $UDID"
+          test -n "$UDID"
+          xcodebuild test -project Wendao.xcodeproj -scheme Wendao \
+            -destination "id=$UDID" -derivedDataPath "$DERIVED" \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee xcodebuild-test.log | grep -E "error:|Test Case .*(passed|failed)|Executed|TEST (SUCCEEDED|FAILED)" || true
+          grep -q "TEST SUCCEEDED" xcodebuild-test.log
+
+      - name: 上传日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: wendao-watch-logs
+          path: |
+            apps/wendao-watch/*.log
+          if-no-files-found: ignore
